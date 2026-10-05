@@ -91,13 +91,33 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 - 「首个可行窗口 10:55–20:59（604 分钟）被固定校准时段『黄昏平场』
   11:20–11:50 UTC 占用，剩余片段不足 45 分钟曝光」
 
-### 6. 版本与导出
+### 6. 版本合并
+
+在左侧「合并两份版本」卡片中选择**基准版**和**补充版**，点击
+**检查冲突 / 预览**：
+
+- 两版的观测点、UTC 日期范围、夜间/暮光、最低高度、最大空气质量必须完全一致；
+  任一不一致都会拒绝合并。
+- 目标按 ID 取并集并去重。仅存在于某一版的目标直接并入；同 ID 目标的名称、
+  坐标、曝光、优先级或手动固定时段任一项不同，会列出冲突，必须逐行选择
+  **保留基准版**或**保留补充版**的**整组定义**。未逐个选择时不能保存。
+- 校准按 ID 取并集并去重。同 ID 校准定义不同、或合并后的校准时段重叠，直接拒绝；
+  相邻校准（首尾相接）允许合并。
+- 冲突选择改变后页面会自动重新检查。检查通过时，服务端会重算全部目标的可行窗口
+  与完整排程，并显示已安排序列和未安排原因；此时才能点击**检查通过后保存新计划**。
+- 选中定义中的手动固定时段会被严格保留。若其因目标定义改变而离开可行窗口、
+  与其他固定时段相撞、占用校准或越界，页面会指出具体目标和时段，**整次合并失败**，
+  不能忽略错误保存。
+- 保存是一次原子写入：只新增一个版本，基准版和补充版保持不变。新版本会自动载入，
+  之后可通过版本列表再次载入、导出，或使用实测曝光核验。
+
+### 7. 版本与导出
 
 - **保存版本**：把当前输入与排程结果存入 SQLite，可随时载入或删除。
 - **导出 JSON**：下载自描述文件 `observation-schedule-YYYY-MM-DD.json`，
   顶层结构为 `{schema, generated_at, request, schedule}`，便于与其他系统对接。
 
-### 7. 实测曝光核验
+### 8. 实测曝光核验
 
 观测执行后，可对照任一**已保存版本**核验实际曝光是否达标（页面右侧
 「实测曝光核验」卡片，或 `POST /api/versions/<id>/verify`）：
@@ -145,6 +165,7 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 | `POST` | `/api/versions` | `{label?, request}` 保存版本（服务端重算） |
 | `GET` | `/api/versions/<id>` | 取版本（含输入与结果） |
 | `DELETE` | `/api/versions/<id>` | 删除版本 |
+| `POST` | `/api/versions/merge` | 预检或原子保存两份版本的严格合并 |
 | `POST` | `/api/versions/<id>/verify` | 实测曝光核验（只读，见下） |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -172,6 +193,38 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 
 > `pins` 为可选的手动固定表：目标 id → 起始分钟（相对网格起点 00:00 UTC）；
 > 非法固定（越界、离开可行窗口、与其他时段重叠）会被服务端拒绝并返回 warning。
+
+### 版本合并接口
+
+`POST /api/versions/merge`。建议先以 `"save": false` 预检；解决全部目标冲突后，
+再以 `"save": true` 做最终核验并一次性写入新版本：
+
+```json
+{
+  "base_version_id": "a1b2c3d4e5f6",
+  "supplement_version_id": "0f1e2d3c4b5a",
+  "target_resolutions": {
+    "m31": "base",
+    "vega": "supplement"
+  },
+  "label": "两晚合并计划（可选）",
+  "save": true
+}
+```
+
+- `target_resolutions` 只需列出“两版都存在但整组定义不同”的目标 ID，
+  取值必须是 `"base"` 或 `"supplement"`；漏选返回 400，且响应的
+  `merge_conflicts.missing_resolutions` 会列出所有待指定 ID。
+- `merge_conflicts.target_conflicts` 给出每个冲突字段及两版整组定义
+  （包括手动固定时段）；`context_mismatches`、`calibration_conflicts`、
+  `calibration_collisions` 分别对应上下文不一致、同 ID 校准定义不同、
+  合并后校准相撞，均不可通过 resolution 忽略。
+- 保存前服务端重新从零计算窗口与排程；若选中的手动固定时段越界、离开新可行窗口、
+  与其他固定时段相撞或占用校准，返回 400 和 `merge_conflicts.pin_errors`，
+  每个错误包含目标 ID/名称、起止 UTC 分钟和原因，**不会写入任何版本**。
+- 预检成功返回 `merged_request`、`selected_side`、完整 `result`、
+  `schedule` 与 `unscheduled`；保存成功额外返回新 `id`/`label`/`created_at`
+  和 `saved: true`。基准版、补充版不会被修改。任一源版本不存在返回 404。
 
 ### 实测核验接口
 
@@ -207,6 +260,7 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 │   ├── astronomy.py        # 儒略日/GMST/太阳历书/赤道→地平/空气质量
 │   ├── scheduling_utils.py # 坐标与时间解析、区间运算
 │   ├── planner.py          # 逐分钟窗口求解 + 贪心排程 + 冲突归因
+│   ├── merge.py            # 两份已保存版本的严格合并、冲突明细与固定时段核验
 │   ├── verification.py     # 实测曝光核验（对照已保存版本，只读）
 │   └── main.py             # Flask 路由、SQLite 版本持久化
 ├── static/

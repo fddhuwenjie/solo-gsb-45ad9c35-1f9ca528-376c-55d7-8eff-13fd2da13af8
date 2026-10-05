@@ -8,6 +8,9 @@ const state = {
   pins: {},             // targetId -> {start_min}（手动拖放/缩放产生的固定时段）
   result: null,         // /api/compute 返回结果
   busy: false,
+  mergeVersions: [],
+  mergePreview: null,
+  mergeResolutions: {},
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -49,7 +52,12 @@ async function api(path, opts) {
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error || `请求失败 (${res.status})`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -733,6 +741,8 @@ async function loadVersions() {
     box.innerHTML = "";
     if (!versions.length) {
       box.innerHTML = `<div class="empty-hint">暂无保存版本</div>`;
+      refreshVerifyVersionOptions(versions);
+      refreshMergeOptions(versions);
       return;
     }
     for (const v of versions) {
@@ -750,6 +760,7 @@ async function loadVersions() {
       box.appendChild(div);
     }
     refreshVerifyVersionOptions(versions);
+    refreshMergeOptions(versions);
   } catch (err) {
     box.innerHTML = `<div class="empty-hint">版本加载失败：${escapeHtml(err.message)}</div>`;
   }
@@ -801,6 +812,239 @@ async function deleteVersion(id) {
     await api(`/api/versions/${id}`, { method: "DELETE" });
     await loadVersions();
   } catch (err) {
+    setStatus("err", err.message);
+  }
+}
+
+/* ================================================================ 版本合并 */
+function refreshMergeOptions(versions) {
+  state.mergeVersions = versions;
+  const make = (sel, empty) => {
+    const current = sel.value;
+    sel.innerHTML = `<option value="">${empty}</option>` + versions.map((v) =>
+      `<option value="${v.id}">${escapeHtml(v.label)}（${v.created_at.slice(0, 16).replace("T", " ")}）</option>`
+    ).join("");
+    if (versions.some((v) => v.id === current)) sel.value = current;
+  };
+  make($("#merge-base"), "— 选择基准版 —");
+  make($("#merge-supplement"), "— 选择补充版 —");
+}
+
+function resetMergeResult(keepResult = false) {
+  if (!keepResult) $("#merge-result").innerHTML = "";
+  $("#btn-merge-save").disabled = true;
+}
+
+const MERGE_FIELD_LABELS = {
+  name: "名称", ra_deg: "赤经", dec_deg: "赤纬",
+  exposure_minutes: "曝光(分)", priority: "优先级", pin: "手动固定时段",
+};
+
+function mergePinText(side) {
+  if (!side.pin_present) return "固定：无";
+  if (!side.pin_valid) return "固定：无效";
+  return `固定：${side.pin_start.slice(5, 16).replace("T", " ")} UTC`;
+}
+
+function mergeTargetText(side) {
+  if (!side) return "<span class='merge-reason'>缺少该目标</span>";
+  const vals = [
+    side.name,
+    `RA=${escapeHtml(String(side.ra))}（${side.ra_deg}°）`,
+    `Dec=${escapeHtml(String(side.dec))}（${side.dec_deg}°）`,
+    `曝光=${side.exposure_minutes} 分`,
+    `优先级=${side.priority}`,
+    escapeHtml(mergePinText(side)),
+  ];
+  return vals.map((x) => `<span>${x}</span>`).join("");
+}
+
+function calSideHtml(c) {
+  return c
+    ? `<div><b>${escapeHtml(c.label)}</b></div><span>${escapeHtml(c.start.replace("T", " ").replace("Z", ""))} – ${escapeHtml(c.end.replace("T", " ").replace("Z", ""))} UTC</span>`
+    : "<span class='merge-reason'>缺少</span>";
+}
+
+function mergeContextValue(v) {
+  if (v && typeof v === "object") {
+    const lat = Number(v.lat).toFixed(4).replace(/\.?0+$/, "");
+    const lon = Number(v.lon).toFixed(4).replace(/\.?0+$/, "");
+    return `${escapeHtml(lat)}, ${escapeHtml(lon)}`;
+  }
+  return escapeHtml(String(v));
+}
+
+function renderMergeConflicts(data) {
+  const d = data.merge_conflicts || {};
+  const box = $("#merge-result");
+  box.innerHTML = "";
+  resetMergeResult(true);
+
+  const section = (title, bad, body) => {
+    const el = document.createElement("div");
+    el.className = "merge-section " + (bad ? "bad" : "ok");
+    el.innerHTML = `<h4>${title}</h4>${body}`;
+    box.appendChild(el);
+  };
+
+  if (d.context_mismatches?.length) {
+    section("❌ 两版观测上下文不一致（不能合并）", true, `
+      <table class="merge-table"><thead><tr><th>字段</th><th>基准版</th><th>补充版</th></tr></thead><tbody>
+      ${d.context_mismatches.map((x) => `
+        <tr><td>${escapeHtml(x.label)}</td>
+          <td>${mergeContextValue(x.base)}</td>
+          <td>${mergeContextValue(x.supplement)}</td></tr>`).join("")}
+      </tbody></table>`);
+  }
+
+  const calRows = (x) =>
+    `<td class="merge-side">${calSideHtml(x.base)}</td><td class="merge-side">${calSideHtml(x.supplement)}</td>`;
+
+  if (d.calibration_conflicts?.length) {
+    section("❌ 同 ID 校准定义不同（校准冲突必须先修正，不能二选一忽略）", true, `
+      <table class="merge-table"><thead><tr><th>ID</th><th>基准版</th><th>补充版</th><th>原因</th></tr></thead><tbody>
+      ${d.calibration_conflicts.map((x) => `
+        <tr><td><code>${escapeHtml(x.calibration_id)}</code></td>${calRows(x)}
+        <td>${escapeHtml(x.reason)}</td></tr>`).join("")}
+      </tbody></table>`);
+  }
+
+  if (d.calibration_collisions?.length) {
+    section("❌ 合并后的校准时段相撞", true, `
+      <table class="merge-table"><thead><tr><th>校准 1</th><th>校准 2</th></tr></thead><tbody>
+      ${d.calibration_collisions.map((x) => `
+        <tr><td><b>${escapeHtml(x.label1)}</b><br>${escapeHtml(x.start1.slice(5,16).replace("T"," "))}–${escapeHtml(x.end1.slice(11,16))}</td>
+        <td><b>${escapeHtml(x.label2)}</b><br>${escapeHtml(x.start2.slice(5,16).replace("T"," "))}–${escapeHtml(x.end2.slice(11,16))}</td></tr>`).join("")}
+      </tbody></table>`);
+  }
+
+  if (d.missing_resolutions?.length || d.invalid_resolutions?.length) {
+    const missing = (d.missing_resolutions || []).map((id) => `<li>目标 <code>${escapeHtml(id)}</code> 尚未选择保留版本</li>`).join("");
+    const invalid = (d.invalid_resolutions || []).map((x) =>
+      `<li>目标 <code>${escapeHtml(x.target_id)}</code> 的选择 <code>${escapeHtml(String(x.supplied))}</code> 无效</li>`).join("");
+    section("⚠ 目标冲突选择未完成", true, `<ul class="merge-reason">${missing}${invalid}</ul>`);
+  }
+
+  if (d.target_conflicts?.length) {
+    const allResolved = !d.missing_resolutions?.length && !d.invalid_resolutions?.length;
+    section(
+      (allResolved ? "✅ 目标冲突已逐个指定" : "🟡 同 ID 目标定义冲突：逐个选择保留整组定义") +
+      `（${d.target_conflicts.length} 项）`,
+      !allResolved,
+      `
+      <table class="merge-table"><thead><tr><th>冲突字段</th><th>基准版整组定义</th><th>补充版整组定义</th><th>保留</th></tr></thead><tbody>
+      ${d.target_conflicts.map((c) => {
+        const chosen = state.mergeResolutions[c.target_id] || "";
+        return `<tr>
+          <td><b>${escapeHtml(c.base.name || c.target_id)}</b><br><code>${escapeHtml(c.target_id)}</code><br>
+            ${c.differences.map((x) => `<span class="badge miss">${MERGE_FIELD_LABELS[x] || x}</span>`).join(" ")}</td>
+          <td class="merge-side">${mergeTargetText(c.base)}</td>
+          <td class="merge-side">${mergeTargetText(c.supplement)}</td>
+          <td><select data-conflict-id="${escapeHtml(c.target_id)}">
+            <option value="">— 请选择 —</option>
+            <option value="base"${chosen === "base" ? " selected" : ""}>保留基准版</option>
+            <option value="supplement"${chosen === "supplement" ? " selected" : ""}>保留补充版</option>
+          </select></td>
+        </tr>`;
+      }).join("")}
+      </tbody></table>`
+    );
+    box.querySelectorAll("select[data-conflict-id]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        state.mergeResolutions[sel.dataset.conflictId] = sel.value;
+        $("#btn-merge-save").disabled = true;
+        setStatus("busy", "已记录冲突选择，请重新检查");
+        checkMerge(false);
+      });
+    });
+  }
+
+  if (d.pin_errors?.length) {
+    section("❌ 手动固定时段无法保留：整次合并失败，未写入新版本", true, `
+      <table class="merge-table"><thead><tr><th>目标</th><th>固定时段</th><th>原因</th></tr></thead><tbody>
+      ${d.pin_errors.map((x) => `<tr><td><b>${escapeHtml(x.name)}</b><br><code>${escapeHtml(x.target_id)}</code></td>
+        <td>${x.start ? `${escapeHtml(x.start.slice(5,16).replace("T"," "))}–${escapeHtml(x.end.slice(11,16))} UTC` : "—"}</td>
+        <td>${escapeHtml(x.reason)}</td></tr>`).join("")}
+      </tbody></table>`);
+  }
+}
+
+function renderMergePreview(data, saved) {
+  state.mergePreview = data;
+  const r = data.result;
+  const unscheduled = (r.unscheduled || []).map((u) =>
+    `<li><b>${escapeHtml(u.name)}</b>：${escapeHtml(u.reason)}</li>`).join("");
+  $("#merge-result").innerHTML = `
+    <div class="merge-section ok">
+      <h4>${saved ? "✅ 已一次性写入新版本，原两份版本未修改" : "✅ 检查通过：可保存为新计划"}</h4>
+      <div class="merge-success">
+        合并目标 <b>${r.targets.length}</b> 个、校准 <b>${r.calibrations.length}</b> 个；
+        已安排 <b>${r.scheduled.length}</b> 段，未安排 <b>${r.unscheduled.length}</b> 个。
+        所有可行窗口与排程已按合并后计划重新计算。
+      </div>
+      ${unscheduled ? `<div class="merge-reason" style="margin-top:6px"><b>未安排原因：</b><ul>${unscheduled}</ul></div>` : ""}
+    </div>`;
+  $("#btn-merge-save").disabled = false;
+}
+
+async function checkMerge(renderBusy = true) {
+  const baseId = $("#merge-base").value;
+  const suppId = $("#merge-supplement").value;
+  if (!baseId || !suppId) {
+    setStatus("err", "请先选择基准版和补充版");
+    return false;
+  }
+  if (baseId === suppId) {
+    setStatus("err", "基准版和补充版不能相同");
+    return false;
+  }
+  if (renderBusy) setStatus("busy", "正在检查合并冲突并重算…");
+  try {
+    const data = await api("/api/versions/merge", {
+      method: "POST",
+      body: JSON.stringify({
+        base_version_id: baseId,
+        supplement_version_id: suppId,
+        target_resolutions: state.mergeResolutions,
+        save: false,
+      }),
+    });
+    state.mergeResolutions = Object.fromEntries(
+      Object.entries(data.selected_side || {}).filter(([id, side]) =>
+        state.mergeResolutions[id] === side
+      )
+    );
+    renderMergePreview(data, false);
+    setStatus("ok", "合并检查通过，可保存新计划");
+    return true;
+  } catch (err) {
+    renderMergeConflicts(err.data || {});
+    setStatus("err", err.message);
+    return false;
+  }
+}
+
+async function saveMerge() {
+  const baseId = $("#merge-base").value;
+  const suppId = $("#merge-supplement").value;
+  setStatus("busy", "正在最终核验并保存合并版本…");
+  try {
+    const data = await api("/api/versions/merge", {
+      method: "POST",
+      body: JSON.stringify({
+        base_version_id: baseId,
+        supplement_version_id: suppId,
+        target_resolutions: state.mergeResolutions,
+        label: $("#merge-label").value.trim(),
+        save: true,
+      }),
+    });
+    renderMergePreview(data, true);
+    setStatus("ok", `合并版本已保存：${data.label}`);
+    await loadVersions();
+    await loadVersion(data.id);
+  } catch (err) {
+    renderMergeConflicts(err.data || {});
     setStatus("err", err.message);
   }
 }
@@ -992,6 +1236,18 @@ function init() {
     setStatus("ok", "已清除全部手动固定并重新自动排程");
   });
   $("#btn-refresh-versions").addEventListener("click", loadVersions);
+
+  // 版本合并
+  $("#btn-merge-check").addEventListener("click", () => checkMerge(true));
+  $("#btn-merge-save").addEventListener("click", saveMerge);
+  for (const id of ["merge-base", "merge-supplement"]) {
+    $("#" + id).addEventListener("change", () => {
+      state.mergePreview = null;
+      state.mergeResolutions = {};
+      resetMergeResult();
+      setStatus("idle", "已切换合并版本，请重新检查冲突");
+    });
+  }
 
   // 实测曝光核验
   $("#verify-version").addEventListener("change", (e) => selectVerifyVersion(e.target.value));

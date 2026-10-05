@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, send_from_directory
 
+from .merge import MergeConflict, prepare_merge
 from .planner import build_plan
 from .scheduling_utils import PlanError
 from .verification import verify_exposures
@@ -126,27 +127,124 @@ def save_version():
     return jsonify({"id": vid, "label": label, "created_at": created, "result": result})
 
 
+def _load_version_row(conn: sqlite3.Connection, vid: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, label, request, result, created_at FROM versions WHERE id = ?",
+        (vid,),
+    ).fetchone()
+
+
+def _version_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "created_at": row["created_at"],
+        "request": json.loads(row["request"]),
+        "result": json.loads(row["result"]),
+    }
+
+
 @app.get("/api/versions/<vid>")
 def get_version(vid):
     conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT id, label, request, result, created_at FROM versions WHERE id = ?",
-            (vid,),
-        ).fetchone()
+        row = _load_version_row(conn, vid)
     finally:
         conn.close()
     if row is None:
         return jsonify(error="版本不存在"), 404
-    return jsonify(
+    return jsonify(_version_from_row(row))
+
+
+@app.post("/api/versions/merge")
+def merge_versions():
+    """合并两份已保存版本；dry-run 预检，save=true 时一次性写入新版本。"""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="请求体必须是 JSON 对象"), 400
+    base_id = str(body.get("base_version_id") or "").strip()
+    supp_id = str(body.get("supplement_version_id") or "").strip()
+    if not base_id or not supp_id:
+        return jsonify(error="必须提供 base_version_id 和 supplement_version_id"), 400
+    if base_id == supp_id:
+        return jsonify(error="基准版和补充版必须是两个不同的已保存版本"), 400
+    resolutions = body.get("target_resolutions") or {}
+    if not isinstance(resolutions, dict):
+        return jsonify(error="target_resolutions 必须是 JSON 对象"), 400
+    save = body.get("save", False)
+    if not isinstance(save, bool):
+        return jsonify(error="save 必须是布尔值"), 400
+    label = str(body.get("label") or "").strip()
+
+    conn = get_db()
+    try:
+        base_row = _load_version_row(conn, base_id)
+        supp_row = _load_version_row(conn, supp_id)
+    finally:
+        conn.close()
+    missing = [
+        name for name, row in (("基准版", base_row), ("补充版", supp_row)) if row is None
+    ]
+    if missing:
+        return jsonify(error="、".join(missing) + "不存在"), 404
+
+    base_version = _version_from_row(base_row)
+    supp_version = _version_from_row(supp_row)
+    try:
+        merged = prepare_merge(base_version, supp_version, resolutions)
+    except MergeConflict as exc:
+        return jsonify(error=str(exc), merge_conflicts=exc.details), 400
+    except PlanError as exc:
+        return jsonify(error=str(exc)), 400
+
+    merged_request = merged["merged_request"]
+    result = merged["result"]
+    out = {
+        "base_version_id": base_id,
+        "base_label": base_version["label"],
+        "supplement_version_id": supp_id,
+        "supplement_label": supp_version["label"],
+        "merged_request": merged_request,
+        "selected_side": merged["selected_side"],
+        "schedule": result["scheduled"],
+        "unscheduled": result["unscheduled"],
+        "result": result,
+    }
+
+    if not save:
+        out["saved"] = False
+        return jsonify(out)
+
+    label = label or f"合并：{base_version['label']} ＋ {supp_version['label']}"
+    vid = uuid.uuid4().hex[:12]
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = get_db()
+    try:
+        with _lock:
+            conn.execute(
+                "INSERT INTO versions (id, label, request, result, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    vid,
+                    label,
+                    json.dumps(merged_request, ensure_ascii=False),
+                    json.dumps(result, ensure_ascii=False),
+                    created,
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    out.update(
         {
-            "id": row["id"],
-            "label": row["label"],
-            "created_at": row["created_at"],
-            "request": json.loads(row["request"]),
-            "result": json.loads(row["result"]),
+            "saved": True,
+            "id": vid,
+            "label": label,
+            "created_at": created,
         }
     )
+    return jsonify(out)
 
 
 @app.delete("/api/versions/<vid>")

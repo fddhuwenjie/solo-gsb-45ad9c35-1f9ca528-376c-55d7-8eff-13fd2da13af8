@@ -12,7 +12,7 @@
     <span class="logo">🔭</span>
     <div>
       <h1>天文观测窗口规划台</h1>
-      <small>球面天文逐分钟求解 · 不重叠排程 · 可拖动调整 · 版本管理</small>
+      <small>球面天文逐分钟求解 · 不重叠排程 · 可拖动调整 · 双版本合并 · 版本管理</small>
     </div>
   </div>
   <div class="top-actions">
@@ -82,6 +82,30 @@
         <button class="btn small" id="btn-refresh-versions">刷新</button>
       </div>
       <div id="version-list" class="version-list"></div>
+    </section>
+
+    <section class="card merge-card">
+      <div class="card-head">
+        <h2>合并两份版本</h2>
+      </div>
+      <label>基准版
+        <select id="merge-base"><option value="">— 选择基准版 —</option></select>
+      </label>
+      <label>补充版
+        <select id="merge-supplement"><option value="">— 选择补充版 —</option></select>
+      </label>
+      <label>新版本名称（可选，保存时留空自动生成）
+        <input id="merge-label" type="text" placeholder="合并版本名称" />
+      </label>
+      <div class="merge-actions">
+        <button class="btn small primary" id="btn-merge-check">检查冲突 / 预览</button>
+        <button class="btn small" id="btn-merge-save" disabled>检查通过后保存新计划</button>
+      </div>
+      <div id="merge-result" class="merge-result"></div>
+      <div class="hint">
+        同 ID 目标的参数或手动固定时段不同，必须逐行选择保留哪一版的<b>整组定义</b>；
+        观测点、日期范围、夜间/高度/空气质量约束不一致，或校准冲突、校准重叠时拒绝合并。
+      </div>
     </section>
   </aside>
 
