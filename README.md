@@ -3,7 +3,8 @@
 输入观测点经纬度、UTC 日期范围和带赤经/赤纬/曝光时长/优先级的观测目标，
 系统按球面天文公式**逐分钟**求解每个目标的可行观测区间，自动排出**互不重叠**的
 观测序列，并保留**固定校准时段**不被占用；对未能安排的目标给出**首个冲突原因**。
-时间线色块可直接**拖动调整**并即时重算，支持**保存版本**（SQLite）与**导出时间表 JSON**。
+时间线色块可直接**拖动调整**并即时重算，支持**保存版本**（SQLite）、
+**两份版本严格合并为可执行新计划**与**导出时间表 JSON**。
 
 后端：Python + Flask + SQLite + NumPy（仅用于逐分钟向量运算）
 前端：原生 HTML / CSS / JavaScript（SVG 时间线，零前端构建、零 CDN 依赖）
@@ -91,9 +92,24 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 - 「首个可行窗口 10:55–20:59（604 分钟）被固定校准时段『黄昏平场』
   11:20–11:50 UTC 占用，剩余片段不足 45 分钟曝光」
 
-### 6. 版本与导出
+### 6. 版本、合并与导出
 
 - **保存版本**：把当前输入与排程结果存入 SQLite，可随时载入或删除。
+- **版本合并（两份已保存版本 → 一份可执行新计划）**：左侧「版本合并」卡片中选择
+  **基准版**与**补充版**，点「分析冲突」后：
+  1. 两版的**观测点、UTC 日期范围、夜间（暮光）模式、最低高度、最大空气质量**
+     任一不一致 → 直接标红拒绝，无法合并；
+  2. **同 ID 目标**的参数（名称/赤经/赤纬/曝光/优先级）或**手动固定时段**不同时，
+     逐行并排显示两版定义，必须在右侧下拉中逐个选择**保留哪一版的整组定义**
+     （含该版的固定时段），未全部选择时合并按钮保持禁用；
+  3. 仅出现在一版的目标、两版完全一致的目标自动并入；**校准各按 ID 去重**，
+     同 ID 校准定义不同或合并后校准时段相撞同样拒绝；
+  4. 点「合并并重算、保存新版本」后服务端重算全部目标的可行窗口与排程，
+     选中定义里的**手动固定时段必须全部保留**：若因目标变更而离开可行窗口、
+     固定时段彼此相撞、或占用固定校准而无法保留，会逐条列出**目标与具体 UTC 时段**，
+     **整次合并失败、不写入任何新版本**（不能忽略警告后保存）；
+  5. 成功时**一次性写入新版本**（原两版不变），工作台自动载入新版本的时间线、
+     排程表与「未安排目标及首个冲突原因」清单；新版本同样支持载入与实测核验。
 - **导出 JSON**：下载自描述文件 `observation-schedule-YYYY-MM-DD.json`，
   顶层结构为 `{schema, generated_at, request, schedule}`，便于与其他系统对接。
 
@@ -145,6 +161,8 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 | `POST` | `/api/versions` | `{label?, request}` 保存版本（服务端重算） |
 | `GET` | `/api/versions/<id>` | 取版本（含输入与结果） |
 | `DELETE` | `/api/versions/<id>` | 删除版本 |
+| `POST` | `/api/versions/merge/prepare` | 两版合并预检：环境比对 + 同 ID 目标/校准冲突分析（只读） |
+| `POST` | `/api/versions/merge` | 严格合并两版，重算并一次性写入新版本（冲突即整体失败） |
 | `POST` | `/api/versions/<id>/verify` | 实测曝光核验（只读，见下） |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -172,6 +190,87 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 
 > `pins` 为可选的手动固定表：目标 id → 起始分钟（相对网格起点 00:00 UTC）；
 > 非法固定（越界、离开可行窗口、与其他时段重叠）会被服务端拒绝并返回 warning。
+
+### 版本合并接口
+
+**预检（不落盘）**：`POST /api/versions/merge/prepare`
+
+```json
+{"base_version_id": "c33faea654f1", "supplement_version_id": "a31b8d4ce325"}
+```
+
+返回（200，即使存在可消解的目标冲突）：
+
+```json
+{
+  "compatible": true,
+  "context": {"site": {"lat": 30.0, "lon": 120.0}, "start_date": "2026-10-15",
+              "end_date": "2026-10-16", "twilight_mode": "astronomical",
+              "min_altitude": 20.0, "max_airmass": 2.5, "minutes": 2880},
+  "hard_mismatches": [],
+  "targets": [
+    {"id": "m31", "name": "M31", "status": "conflict",
+     "differ_fields": ["exposure"], "pin_diff": true,
+     "base": {"id": "m31", "ra": "00h42m44s", "exposure_minutes": 45,
+              "pin": {"start_min": 622, "end_min": 667,
+                      "start": "2026-10-15T10:22Z", "end": "2026-10-15T11:07Z"}},
+     "supplement": {"id": "m31", "exposure_minutes": 60, "pin": null}},
+    {"id": "vega", "status": "base_only", "base": {...}, "supplement": null},
+    {"id": "m42", "status": "supplement_only", "base": null, "supplement": {...}}
+  ],
+  "target_conflict_ids": ["m31"],
+  "calibrations": [
+    {"id": "c1", "status": "identical", "base": {...}, "supplement": {...}},
+    {"id": "c2", "status": "supplement_only", "base": null, "supplement": {...}}
+  ],
+  "cal_conflicts": [],
+  "cal_overlaps": [],
+  "counts": {"targets_base": 2, "targets_supplement": 2, "targets_merged": 3,
+             "target_conflicts": 1, "calibrations_merged": 2}
+}
+```
+
+- `hard_mismatches` 非空（观测点/日期/暮光/高度/空气质量不一致）、
+  `cal_conflicts` 非空（同 ID 校准定义不同）或 `cal_overlaps` 非空（合并后校准时段相撞）
+  时 `compatible=false`，页面标红且无法提交合并。
+- `status` 取值：`identical`（两版一致，自动取基准版）、`base_only`、`supplement_only`、
+  `conflict`（须提交消解）。
+
+**提交合并**：`POST /api/versions/merge`
+
+```json
+{
+  "base_version_id": "c33faea654f1",
+  "supplement_version_id": "a31b8d4ce325",
+  "resolutions": {"m31": "base"},
+  "label": "可选，留空自动生成"
+}
+```
+
+- `resolutions` 只需、且必须覆盖全部 `target_conflict_ids`，值为 `"base"` 或
+  `"supplement"`，表示保留该版本的**整组目标定义**（参数 + 手动固定时段）；
+  缺失、多余或取值非法都会被拒绝。
+- 服务端重新做全部校验后用合并输入重算排程，并**严格**验证选中定义中的每个手动固定时段：
+  离开合并后可行窗口、与其他固定时段相撞、或占用校准即失败。
+- **成功（200）**：一次性写入新版本并返回
+  `{id, label, created_at, request, result, chosen_side, sources}`，`result` 即新排程
+  （含 `scheduled` 与 `unscheduled` 未安排原因），两份原版本保持不变，新版本可
+  `GET /api/versions/<id>` 载入并可调用核验接口。
+- **失败（409）**：不写入任何新版本，响应体
+  `{error, details:{analysis, unresolved_targets?|pin_errors?|...}}`；
+  `pin_errors` 逐条给出无法保留的 `target_id`、`name`、`start/end`（UTC）与原因。
+- 基准版与补充版相同 → `400`；任一版本不存在 → `404`。
+
+```bash
+# 命令行示例：先预检再提交
+curl -s -X POST localhost:8000/api/versions/merge/prepare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version_id":"<idA>","supplement_version_id":"<idB>"}'
+curl -s -X POST localhost:8000/api/versions/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version_id":"<idA>","supplement_version_id":"<idB>",
+       "resolutions":{"m31":"base"}'
+```
 
 ### 实测核验接口
 
@@ -207,6 +306,7 @@ PORT=8000 PLANNER_DB=./data/planner.db python -m app.main
 │   ├── astronomy.py        # 儒略日/GMST/太阳历书/赤道→地平/空气质量
 │   ├── scheduling_utils.py # 坐标与时间解析、区间运算
 │   ├── planner.py          # 逐分钟窗口求解 + 贪心排程 + 冲突归因
+│   ├── merging.py          # 两版本合并：环境/目标/校准冲突分析 + 严格提交
 │   ├── verification.py     # 实测曝光核验（对照已保存版本，只读）
 │   └── main.py             # Flask 路由、SQLite 版本持久化
 ├── static/

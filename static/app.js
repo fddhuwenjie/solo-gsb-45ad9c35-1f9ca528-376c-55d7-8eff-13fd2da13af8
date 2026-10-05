@@ -750,6 +750,7 @@ async function loadVersions() {
       box.appendChild(div);
     }
     refreshVerifyVersionOptions(versions);
+    refreshMergeSelectors(versions);
   } catch (err) {
     box.innerHTML = `<div class="empty-hint">版本加载失败：${escapeHtml(err.message)}</div>`;
   }
@@ -802,6 +803,252 @@ async function deleteVersion(id) {
     await loadVersions();
   } catch (err) {
     setStatus("err", err.message);
+  }
+}
+
+/* ================================================================ 版本合并 */
+const mstate = {
+  versions: [],     // 最新版本列表（{id,label,created_at}）
+  baseId: "",
+  suppId: "",
+  analysis: null,   // /merge/prepare 结果
+};
+
+function refreshMergeSelectors(versions) {
+  mstate.versions = versions || mstate.versions;
+  const fill = (sel, ph) => {
+    const keep = sel.value;
+    sel.innerHTML = `<option value="">${ph}</option>` +
+      mstate.versions.map((v) =>
+        `<option value="${v.id}">${escapeHtml(v.label)}（${v.created_at.slice(0, 16).replace("T", " ")}）</option>`
+      ).join("");
+    if (keep && mstate.versions.some((v) => v.id === keep)) sel.value = keep;
+  };
+  fill($("#merge-base"), "— 选择基准版 —");
+  fill($("#merge-supp"), "— 选择补充版 —");
+}
+
+async function analyzeMerge() {
+  mstate.baseId = $("#merge-base").value;
+  mstate.suppId = $("#merge-supp").value;
+  if (!mstate.baseId || !mstate.suppId) {
+    showMergeErrors("请先选择基准版和补充版。");
+    return;
+  }
+  if (mstate.baseId === mstate.suppId) {
+    showMergeErrors("基准版与补充版不能是同一个版本。");
+    return;
+  }
+  setStatus("busy", "合并分析中…");
+  try {
+    mstate.analysis = await api("/api/versions/merge/prepare", {
+      method: "POST",
+      body: JSON.stringify({
+        base_version_id: mstate.baseId,
+        supplement_version_id: mstate.suppId,
+      }),
+    });
+    renderMergePanel();
+    setStatus("ok", "合并冲突分析完成");
+  } catch (err) {
+    mstate.analysis = null;
+    renderMergePanel();
+    showMergeErrors(err.message);
+    setStatus("err", err.message);
+  }
+}
+
+function showMergeErrors(text) {
+  const box = $("#merge-errors");
+  box.hidden = !text;
+  box.textContent = text || "";
+}
+
+const MERGE_FIELD_LABEL = {
+  name: "名称", ra: "赤经", dec: "赤纬", exposure: "曝光(分)", priority: "优先级",
+};
+
+function fmtPin(p) {
+  if (!p) return '<span style="color:var(--muted)">无手动固定</span>';
+  return `🟡 固定 <code>${escapeHtml(p.start.slice(5).replace("T", " "))}–` +
+         `${escapeHtml(p.end.slice(11, 16))} UTC</code>（${p.end_min - p.start_min} 分）`;
+}
+
+function renderDefSide(side, view, differFields, pinDiff) {
+  if (!view) return `<div class="mc-def ${side}-def"><b>该版本无此目标</b></div>`;
+  const cell = (key, raw) => {
+    const diff = differFields.includes(key);
+    return `<div${diff ? ' class="diff"' : ""}>${MERGE_FIELD_LABEL[key]}：` +
+           `<b>${escapeHtml(String(raw ?? ""))}</b>${diff ? " ◀ 不同" : ""}</div>`;
+  };
+  return `<div class="mc-def ${side}-def">
+      <div><b>${side === "base" ? "基准版" : "补充版"}</b></div>
+      ${cell("name", view.name)}
+      ${cell("ra", view.ra)}
+      ${cell("dec", view.dec)}
+      ${cell("exposure", view.exposure_minutes)}
+      ${cell("priority", view.priority)}
+      <div class="mc-pin">${fmtPin(view.pin)}</div>
+    </div>`;
+}
+
+function renderMergePanel() {
+  const a = mstate.analysis;
+  showMergeErrors("");
+  const tbox = $("#merge-conflicts");
+  const cbox = $("#merge-cals");
+  const sbox = $("#merge-summary");
+  tbox.innerHTML = "";
+  cbox.innerHTML = "";
+  sbox.innerHTML = "";
+  $("#btn-merge-commit").disabled = true;
+  if (!a) return;
+
+  // ---- 硬性环境冲突 / 校准冲突 / 校准相撞：一律拒绝（页面展示，不提供消解）
+  const fatal = (a.hard_mismatches || []).map((x) => "⛔ " + x.message);
+  for (const c of a.cal_conflicts || []) {
+    const b = c.base || {}, s = c.supplement || {};
+    const span = (v) => v.start
+      ? `${v.start.slice(5).replace("T", " ")}–${v.end.slice(11, 16)} UTC`
+      : "（落在日期范围外）";
+    fatal.push(`⛔ 同 ID 校准「${c.id}」两版定义不同：基准版「${b.label ?? ""}」${span(b)}` +
+               `；补充版「${s.label ?? ""}」${span(s)}，拒绝合并`);
+  }
+  for (const ov of a.cal_overlaps || []) {
+    fatal.push(`⛔ 合并后校准时段相撞：「${ov.a.label}」${ov.a.start.slice(5).replace("T", " ")}–${ov.a.end.slice(11, 16)} UTC` +
+               ` 与「${ov.b.label}」${ov.b.start.slice(5).replace("T", " ")}–${ov.b.end.slice(11, 16)} UTC`);
+  }
+
+  // ---- 同 ID 目标冲突：逐个选择保留哪一版的整组定义
+  const conflict = a.targets.filter((t) => t.status === "conflict");
+  const nBase = a.targets.filter((t) => t.status === "base_only").length;
+  const nSupp = a.targets.filter((t) => t.status === "supplement_only").length;
+  const nSame = a.targets.filter((t) => t.status === "identical").length;
+
+  for (const t of conflict) {
+    const item = document.createElement("div");
+    item.className = "mc-item conflict";
+    item.dataset.targetId = t.id;
+    const fields = t.differ_fields.map((f) => MERGE_FIELD_LABEL[f]).join("、");
+    const why = [fields, t.pin_diff ? "手动固定时段" : ""].filter(Boolean).join("、");
+    item.innerHTML = `
+      <div class="mc-head">
+        <span class="mc-name">${escapeHtml(t.name)}</span>
+        <code>${escapeHtml(t.id)}</code>
+        <span class="mc-tag conf">冲突：${escapeHtml(why)}</span>
+        <select class="mc-pick">
+          <option value="">— 保留哪版整组 —</option>
+          <option value="base">保留基准版</option>
+          <option value="supplement">保留补充版</option>
+        </select>
+      </div>
+      <div class="mc-side">
+        ${renderDefSide("base", t.base, t.differ_fields, t.pin_diff)}
+        ${renderDefSide("supplement", t.supplement, t.differ_fields, t.pin_diff)}
+      </div>`;
+    item.querySelector(".mc-pick").addEventListener("change", updateMergeReady);
+    tbox.appendChild(item);
+  }
+
+  // 非冲突目标紧凑概览
+  const quiet = [];
+  if (nSame) quiet.push(`<span class="mc-tag same">两版一致 ×${nSame}</span>`);
+  if (nBase) quiet.push(`<span class="mc-tag base">仅基准版 ×${nBase}</span>`);
+  if (nSupp) quiet.push(`<span class="mc-tag supp">仅补充版 ×${nSupp}</span>`);
+  if (quiet.length) {
+    const div = document.createElement("div");
+    div.className = "mc-item";
+    div.innerHTML = `<div class="mc-head">${quiet.join(" ")}` +
+      `<span class="mc-tag same">自动按 ID 去重并入</span></div>`;
+    tbox.appendChild(div);
+  }
+
+  // 校准概览
+  const calSame = a.calibrations.filter((c) => c.status === "identical").length;
+  const calBase = a.calibrations.filter((c) => c.status === "base_only").length;
+  const calSupp = a.calibrations.filter((c) => c.status === "supplement_only").length;
+  const calBits = [];
+  if (calSame) calBits.push(`两版一致 ×${calSame}`);
+  if (calBase) calBits.push(`仅基准版 ×${calBase}`);
+  if (calSupp) calBits.push(`仅补充版 ×${calSupp}`);
+  if (calBits.length) {
+    cbox.innerHTML = `🛠️ 校准按 ID 去重：${escapeHtml(calBits.join("，"))}；合并后共 ` +
+      `<b>${a.counts.calibrations_merged}</b> 个固定校准时段。`;
+  }
+
+  if (fatal.length) showMergeErrors(fatal.join("\n"));
+
+  sbox.innerHTML =
+    `合并后目标 <b>${a.counts.targets_merged}</b> 个（基准 ${a.counts.targets_base} + ` +
+    `补充 ${a.counts.targets_supplement}，同 ID 冲突 <b>${a.counts.target_conflicts}</b> 个）。` +
+    (!a.compatible
+      ? "⛔ 存在不可消解的冲突，拒绝合并。"
+      : conflict.length
+        ? `⚠ ${conflict.length} 个同 ID 目标需逐个选择保留哪一版的整组定义（含手动固定），未选择则无法合并。`
+        : "✅ 两版环境一致且无定义冲突，可直接合并。");
+
+  updateMergeReady();
+}
+
+function updateMergeReady() {
+  const a = mstate.analysis;
+  const btn = $("#btn-merge-commit");
+  if (!a) { btn.disabled = true; btn.textContent = "合并并重算、保存新版本"; return; }
+  const picks = document.querySelectorAll("#merge-conflicts .mc-item.conflict .mc-pick");
+  let resolved = 0;
+  for (const sel of picks) {
+    if (sel.value === "base" || sel.value === "supplement") resolved++;
+  }
+  const allResolved = resolved === picks.length;
+  btn.disabled = !(a.compatible && allResolved);
+  if (btn.disabled) {
+    btn.textContent = !a.compatible
+      ? "存在不可消解冲突，无法合并"
+      : `还有 ${picks.length - resolved} 个冲突目标未选择保留版本`;
+  } else {
+    btn.textContent = "合并并重算、保存新版本";
+  }
+}
+
+function collectResolutions() {
+  const out = {};
+  document.querySelectorAll("#merge-conflicts .mc-item.conflict").forEach((item) => {
+    const v = item.querySelector(".mc-pick").value;
+    if (v) out[item.dataset.targetId] = v;
+  });
+  return out;
+}
+
+async function commitMerge() {
+  if (!mstate.analysis) return;
+  setStatus("busy", "合并并重算中…");
+  try {
+    const v = await api("/api/versions/merge", {
+      method: "POST",
+      body: JSON.stringify({
+        base_version_id: mstate.baseId,
+        supplement_version_id: mstate.suppId,
+        resolutions: collectResolutions(),
+        label: $("#merge-label").value.trim(),
+      }),
+    });
+    // 一次性写入成功：把新版本载入工作台（时间线即新排程），未安排原因见下方清单
+    applyRequest(v.request);
+    state.result = v.result;
+    renderAll();
+    $("#merge-label").value = "";
+    mstate.analysis = null;
+    renderMergePanel();
+    setStatus("ok", `✅ 已生成合并版本：${v.label}`);
+    await loadVersions();
+    if ((v.result.unscheduled || []).length) {
+      $("#unscheduled-list").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  } catch (err) {
+    // 整次失败、未保存任何新版本；错误（含无法保留的目标与固定时段）逐条展示
+    showMergeErrors(err.message);
+    $("#merge-errors").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setStatus("err", "合并被拒绝，未保存新版本");
   }
 }
 
@@ -992,6 +1239,12 @@ function init() {
     setStatus("ok", "已清除全部手动固定并重新自动排程");
   });
   $("#btn-refresh-versions").addEventListener("click", loadVersions);
+
+  // 版本合并
+  $("#btn-merge-analyze").addEventListener("click", analyzeMerge);
+  $("#btn-merge-commit").addEventListener("click", commitMerge);
+  $("#merge-base").addEventListener("change", () => { mstate.analysis = null; renderMergePanel(); showMergeErrors(""); });
+  $("#merge-supp").addEventListener("change", () => { mstate.analysis = null; renderMergePanel(); showMergeErrors(""); });
 
   // 实测曝光核验
   $("#verify-version").addEventListener("change", (e) => selectVerifyVersion(e.target.value));

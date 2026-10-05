@@ -83,6 +83,32 @@
       </div>
       <div id="version-list" class="version-list"></div>
     </section>
+
+    <section class="card" id="merge-card">
+      <div class="card-head">
+        <h2>版本合并（两份 → 新计划）</h2>
+        <button class="btn small primary" id="btn-merge-analyze">分析冲突</button>
+      </div>
+      <label>基准版
+        <select id="merge-base"><option value="">— 选择基准版 —</option></select>
+      </label>
+      <label>补充版
+        <select id="merge-supp"><option value="">— 选择补充版 —</option></select>
+      </label>
+      <div id="merge-errors" class="merge-errors" hidden></div>
+      <div id="merge-conflicts" class="merge-conflicts"></div>
+      <div id="merge-cals" class="merge-cals"></div>
+      <div id="merge-summary" class="merge-summary hint"></div>
+      <label style="margin-top:8px">新版本名称
+        <input id="merge-label" type="text" placeholder="留空则自动生成" />
+      </label>
+      <button class="btn primary" id="btn-merge-commit" style="width:100%" disabled>合并并重算、保存新版本</button>
+      <div class="hint">
+        同 ID 目标的参数或<b>手动固定时段</b>不同时，必须逐个选择保留哪一版的<b>整组定义</b>；
+        观测点、UTC 日期范围、夜间/高度/空气质量约束不一致，或同 ID 校准不同、校准时段相撞，
+        将直接拒绝合并。固定时段无法保留时整次合并不保存任何新版本。
+      </div>
+    </section>
   </aside>
 
   <!-- ============================ 右侧：结果区 ============================ -->

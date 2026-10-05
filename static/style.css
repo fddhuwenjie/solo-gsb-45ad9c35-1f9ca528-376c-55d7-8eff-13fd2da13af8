@@ -162,6 +162,54 @@ input.invalid { border-color: var(--danger); }
 .version-item .v-date { color: var(--muted); font-size: 11px; }
 .version-item button { padding: 2px 8px; font-size: 11px; }
 
+/* -------------------------------------------------------------- merging */
+.merge-errors {
+  border-left: 3px solid var(--danger);
+  background: rgba(255,107,107,.07);
+  border-radius: 0 8px 8px 0;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #ffc9c9;
+  line-height: 1.6;
+  white-space: pre-line;
+}
+.merge-conflicts { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+.merge-conflicts::-webkit-scrollbar { width: 8px; }
+.merge-conflicts::-webkit-scrollbar-thumb { background: #2a3558; border-radius: 4px; }
+.mc-item {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 12px;
+}
+.mc-item.conflict { border-color: #7a6320; background: rgba(255,180,84,.06); }
+.mc-item.cal-conflict { border-color: #7a3030; background: rgba(255,107,107,.06); }
+.mc-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mc-head .mc-name { font-weight: 600; }
+.mc-head select { width: auto; margin-left: auto; padding: 3px 6px; font-size: 11px; }
+.mc-tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.mc-tag.base { color: #9ec1ff; border-color: #3b5fd9; }
+.mc-tag.supp { color: #8be7c8; border-color: #2e6b58; }
+.mc-tag.same { color: var(--muted); }
+.mc-tag.conf { color: #ffd866; border-color: #7a6320; background: #4a3d10; }
+.mc-tag.bad { color: #ff9c9c; border-color: #7a3030; background: #3a1d1d; }
+.mc-side { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+.mc-def {
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 7px;
+  font-size: 11px; color: var(--muted); line-height: 1.55; min-width: 0;
+}
+.mc-def.base-def { border-color: #324273; }
+.mc-def.supp-def { border-color: #275144; }
+.mc-def b { color: var(--text); font-weight: 600; }
+.mc-def .diff { color: #ffd866; }
+.mc-def code { color: #aab8ee; font-family: ui-monospace, Consolas, monospace; }
+.mc-pin { margin-top: 3px; color: #ffd866; }
+.merge-summary { margin-top: 8px; }
+.merge-cals { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.merge-cals .mc-calwarn { color: #ffc9c9; font-size: 12px; line-height: 1.6; margin-top: 4px; }
+
 /* -------------------------------------------------------------- warning */
 .warnings {
   background: #2a2113;
